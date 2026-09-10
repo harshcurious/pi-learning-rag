@@ -643,3 +643,120 @@ rag/local-rag/docs/
 ```
 
 Do not implement embeddings yet. When finished, tell me the file path; I’ll review it without modifying it.
+
+
+> [!quote] YOU
+
+What's meant by **Produce stable IDs such as returns-0, returns-1.**?
+
+
+> [!abstract] PI
+
+A **stable ID** means the same unchanged document produces the same chunk identifiers every time you run the chunker.
+
+For `returns.md`, chunks might receive:
+
+```text
+returns-0
+returns-1
+returns-2
+```
+
+Here:
+
+- `returns` comes from `path.stem`
+- `0`, `1`, `2` are chunk positions
+
+So rerunning the chunker should not generate random IDs such as UUIDs.
+
+A vector database needs unique IDs to update, retrieve, or delete specific chunks without creating duplicates. For this exercise, “stable” only means stable while the document and chunking settings remain unchanged. If earlier content changes, later chunk numbers may shift.
+
+
+> [!quote] YOU
+
+I have created the file `rag/local-rag/chunking.py`. Analyze and
+suggest improvements.
+
+
+> [!abstract] PI
+
+## Review of `rag/local-rag/chunking.py`
+
+Good instincts first: the `Chunk` dataclass matches the spec, and your hidden-path filter (line 12–15) correctly keeps `.cache/huggingface/...` out of the corpus — that's a real corpus-hygiene concern you spotted on your own. Using a real Markdown dataset from Hugging Face is also better than my toy corpus.
+
+But the code is **not up to standard yet**. It fails in four separate ways, and two of them fail *silently*. I verified every claim below by executing your file.
+
+### 1. Blockers — the function cannot run
+
+- **Line 17:** `mo.output.append(file)` — `mo` is never imported here. Calling `chunk_markdown` raises `NameError: name 'mo' is not defined` (verified). This is marimo notebook state that leaked into a plain module.
+- **Line 27:** `MAX_CHAR` is undefined in this file — it only exists as a notebook cell variable. Second `NameError`. Meanwhile the `max_chars` parameter you declared is **never used**. Line 10 promises an interface the body ignores.
+
+### 2. Silent data loss — the RAG-fatal ones
+
+- **No final flush.** After the paragraph loop ends (line 36), whatever is sitting in `current_para_combo` is never appended. Verified: a 600-char paragraph disappeared entirely; the file yielded 1 chunk instead of 2.
+- **Line 37: `return all_chunks` is inside `for file`.** Only the *first* file from the glob is ever processed, and glob order is not sorted, so "first" is nondeterministic. Verified: a 2-file corpus returned **0 chunks**.
+- **Oversized first paragraph produces an empty chunk.** Because there's no `if current_para_combo:` guard, `len("" + para) < MAX_CHAR` is `False` when the very first paragraph exceeds the limit — so the `else` branch fires and stores a chunk whose `text` is `""`. Verified: `id='local-rag/doc/first.md-00000' len(text)=0`.
+
+For RAG this is the worst class of bug: a silently missing or empty chunk is unrecoverable downstream. The retriever can't find what ingestion never stored, and later you'd blame the embedding model or the LLM for a failure that happened in this file.
+
+### 3. Content corruption
+
+- **Line 28: `current_para_combo += para` drops the paragraph separator.** Verified output: `'Alpha paragraph about returns.Beta paragraph about refunds.'` Two paragraphs fused into one sentence, with a period in the middle. You embed text that is *not* what the source says, and the LLM later reads that mangled sentence as evidence. Line 27's length check is likewise measuring the glued length, not the length you actually store.
+
+### 4. Interface and spec violations
+
+- **The `path` argument is ignored.** Line 13 hardcodes `Path("local-rag/doc")`, relative to the current working directory. Run from anywhere else and the glob silently yields nothing — an empty index with no error.
+- **Line 33: `source=file`** is a `PosixPath`, but the field is annotated `str`. Use the file name.
+- **Line 31: ID format.** You produce `'local-rag/doc/first.md-00000'`, not `first-0`. Worse than cosmetic: the ID contains the build path, so moving or renaming the corpus folder changes every ID and breaks any persisted collection.
+- **No `ValueError` for `max_chars <= 0`**, and the default is 512 rather than 500.
+
+### 5. Craft
+
+- **Line 31: `id` shadows the Python builtin.**
+- Dead commented code (lines 21–22, 30, 32) and debug output left in place.
+- No module docstring.
+- **Scope creep:** `chunk_markdown` both chunks a file *and* walks a directory. Split it — a pure `chunk_markdown(path, max_chars)` (one file → chunks) plus a separate `load_chunks(docs_dir)` that walks. A pure function is what lets you test chunking independently of the corpus.
+- `doc/README.md` and `doc/.gitattributes` from the HF snapshot are real files and will become chunks. Decide deliberately whether the dataset card belongs in your knowledge base.
+
+Here is one check on the edge-case logic that caused most of the above:
+
+
+> [!question] Quiz
+> Your paragraph loop has finished accumulating paragraphs for a file, and the final paragraph was small enough to fit in the current group. What must the function do before moving to the next file?
+>
+> 1. Discard the partial group because it is under the limit
+> 2. Append the remaining accumulated group as a final chunk
+> 3. Re-run the loop with a smaller maximum size for that file
+> 4. Merge the partial group into the next file's first chunk
+
+
+> [!warning] Quiz — cancelled
+> (user skipped)
+
+
+> [!quote] YOU
+
+2. Append the remaining accumulated group as a final chunk
+
+
+> [!abstract] PI
+
+Correct — that's exactly it. The tail of every file sits unemitted because a chunk is only written when the *next* paragraph overflows the limit. Flushing after the loop is what closes that gap.
+
+## Rewrite `rag/local-rag/chunking.py`
+
+Behavioral requirements — no implementation from me:
+
+1. **No `mo` references.** `chunking.py` must be a plain importable module; keep marimo in the notebook file.
+2. **Use the `max_chars` parameter.** No module-level `MAX_CHAR`.
+3. **Validate** `max_chars > 0`, else `ValueError`.
+4. **Flush after the paragraph loop** (the point you just got right).
+5. **Guard the empty case:** when the group is empty and the incoming paragraph is itself oversized, it must become its own chunk — never emit a chunk with empty `text`.
+6. **Keep the separator when joining** paragraphs, so stored text matches the source text you measured.
+7. **Fix the early return:** every file in the corpus must be processed.
+8. **Split responsibilities:** `chunk_markdown(path, max_chars)` handles one file and ignores the directory entirely; a separate `load_chunks(docs_dir)` walks `docs/*.md` and calls it. Your hidden-path filter belongs in `load_chunks`.
+9. **`source` must be a `str`** (the file name).
+10. **IDs:** `f"{path.stem}-{index}"` → `returns-0`, `returns-1`. No directory path, no extension, no builtin shadowing (`id` → rename the variable).
+11. Delete the commented-out code and debug appends, and add a module docstring.
+
+Then verify it yourself before handing it over: run it on a file whose **last** paragraph is short, and on the real `doc/` corpus, and check that (a) the number of chunks is what you expect, (b) the last chunk contains the document's final paragraph, and (c) no chunk has empty text. Report the path when done — I'll review it without editing.
